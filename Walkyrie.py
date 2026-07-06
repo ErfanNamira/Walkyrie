@@ -491,8 +491,6 @@ class DownloadController:
                 return ch.lower() if ch else None
             return None
 
-        # stdin isn't a real TTY (piped input, some IDE consoles, etc.) —
-        # cbreak mode isn't available, so fall back to line-buffered reads.
         try:
             line = sys.stdin.readline()
         except (EOFError, ValueError):
@@ -988,23 +986,48 @@ def process_queue(db: QueueDB, api_key: Optional[str], workers: Optional[int] = 
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 future_to_item = {}
-                for item in items_to_process:
+                pending_items = iter(items_to_process)
+
+                def submit_next() -> bool:
+                    """Submit one more item if we're not paused/aborted and
+                    there's one left. Returns False when there's nothing
+                    more to submit (queue exhausted or aborted)."""
                     if controller.abort.is_set():
-                        break
+                        return False
                     wait_if_paused_with_indicator(bar, task_id)
                     if controller.abort.is_set():
-                        break
+                        return False
+                    item = next(pending_items, None)
+                    if item is None:
+                        return False
                     fut = pool.submit(download_image, item, item["folder"], api_key)
                     future_to_item[fut] = item
+                    return True
 
-                for fut in concurrent.futures.as_completed(future_to_item):
-                    item = future_to_item[fut]
-                    try:
-                        ok, filename, message = fut.result()
-                    except Exception as e:  # noqa: BLE001
-                        ok, filename, message = False, item.get("id", "?"), str(e)
-                    handle_result(item, ok, filename, message)
-                    bar.update(task_id, advance=1)
+                # Prime the pool with only as many in-flight jobs as we
+                # have workers, instead of dumping the entire queue into
+                # the executor at once (which made pause/abort a no-op
+                # since everything was already queued internally).
+                for _ in range(workers):
+                    if not submit_next():
+                        break
+
+                while future_to_item:
+                    done, _ = concurrent.futures.wait(
+                        future_to_item.keys(),
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    for fut in done:
+                        item = future_to_item.pop(fut)
+                        try:
+                            ok, filename, message = fut.result()
+                        except Exception as e:  # noqa: BLE001
+                            ok, filename, message = False, item.get("id", "?"), str(e)
+                        handle_result(item, ok, filename, message)
+                        bar.update(task_id, advance=1)
+                        # Top up the pool with the next queued item, respecting
+                        # pause/abort at the moment of submission.
+                        submit_next()
     except (KeyboardInterrupt, EOFError):
         print()
         warn("Download interrupted. Progress saved — remaining items stay in the queue.")

@@ -36,7 +36,9 @@ import argparse
 import concurrent.futures
 import json
 import os
+import queue
 import re
+import select
 import shutil
 import sqlite3
 import sys
@@ -46,6 +48,21 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Iterator
+
+# Platform-specific single-keypress readers. Exactly one of these will be
+# available; DownloadController picks whichever applies at runtime.
+try:
+    import termios
+    import tty
+    _HAS_TERMIOS = True
+except ImportError:  # Windows
+    _HAS_TERMIOS = False
+
+try:
+    import msvcrt
+    _HAS_MSVCRT = True
+except ImportError:  # POSIX
+    _HAS_MSVCRT = False
 
 import requests
 from rich.console import Console
@@ -282,10 +299,6 @@ def migrate_legacy_queue(raw_cfg: dict, db: "QueueDB"):
 # ----------------------------------------------------------------------
 class QueueDB:
     """Thread-safe wrapper around the SQLite queue/history database.
-
-    Using SQLite instead of a JSON array means adding/removing single
-    items is an indexed O(log n) operation instead of rewriting the whole
-    file, which matters a lot once the queue holds thousands of entries.
     """
 
     def __init__(self, path: str):
@@ -419,7 +432,7 @@ class QueueDB:
 # ----------------------------------------------------------------------
 class DownloadController:
     """
-    Background thread listens on stdin for commands while a download is in
+    Background thread listens for keypresses while a download is in
     progress, so the user can pause/resume/abort without killing the script.
 
       p -> pause (workers finish their current file, then wait)
@@ -430,40 +443,109 @@ class DownloadController:
     def __init__(self):
         self.paused = threading.Event()
         self.abort = threading.Event()
-        self._thread = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     def start(self):
         self.paused.clear()
         self.abort.clear()
+        self._stop.clear()
         self._thread = threading.Thread(target=self._listen, daemon=True)
         self._thread.start()
         console.print(
-            "[bold magenta]⌨️  Controls:[/bold magenta] type 'p' + Enter to pause, "
-            "'r' + Enter to resume, 'q' + Enter to stop and save progress."
+            "[bold magenta]⌨️  Controls:[/bold magenta] press [bold]p[/bold] to pause, "
+            "[bold]r[/bold] to resume, [bold]q[/bold] to stop and save progress "
+            "(no Enter needed)."
         )
 
-    def _listen(self):
-        while not self.abort.is_set():
+    def stop(self):
+        """Tell the listener thread to exit once the download loop is done,
+        even if the user never pressed 'q'."""
+        self._stop.set()
+
+    def join(self, timeout: float = 1.0):
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    # -- key reading ---------------------------------------------------
+    def _read_key(self) -> Optional[str]:
+        """Return one lowercase char as soon as it's available, or None if
+        nothing was typed within the poll window. Non-blocking so the loop
+        can also check self._stop/self.abort regularly."""
+        if _HAS_MSVCRT:
+            if msvcrt.kbhit():
+                try:
+                    return msvcrt.getwch().lower()
+                except UnicodeDecodeError:
+                    return None
+            time.sleep(0.1)
+            return None
+
+        if _HAS_TERMIOS and sys.stdin.isatty():
             try:
-                line = sys.stdin.readline()
-            except (EOFError, ValueError):
-                return
-            if not line:
-                return
-            cmd = line.strip().lower()
-            if cmd == "p":
-                if not self.paused.is_set():
-                    self.paused.set()
-                    warn("⏸️  Pausing after in-flight files finish... (type 'r' to resume)")
-            elif cmd == "r":
-                if self.paused.is_set():
+                ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            except (OSError, ValueError):
+                return None
+            if ready:
+                ch = sys.stdin.read(1)
+                return ch.lower() if ch else None
+            return None
+
+        # stdin isn't a real TTY (piped input, some IDE consoles, etc.) —
+        # cbreak mode isn't available, so fall back to line-buffered reads.
+        try:
+            line = sys.stdin.readline()
+        except (EOFError, ValueError):
+            self.abort.set()
+            return None
+        if not line:
+            self.abort.set()
+            return None
+        return line.strip().lower()
+
+    def _listen(self):
+        use_cbreak = _HAS_TERMIOS and sys.stdin.isatty()
+        fd = None
+        old_settings = None
+        if use_cbreak:
+            fd = sys.stdin.fileno()
+            try:
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except termios.error:
+                use_cbreak = False
+                old_settings = None
+
+        try:
+            while not self._stop.is_set() and not self.abort.is_set():
+                cmd = self._read_key()
+                if not cmd:
+                    continue
+                if cmd == "p":
+                    if not self.paused.is_set():
+                        self.paused.set()
+                        console.print(
+                            "[yellow]⏸️  Pausing after in-flight files finish... "
+                            "(press 'r' to resume)[/yellow]"
+                        )
+                elif cmd == "r":
+                    if self.paused.is_set():
+                        self.paused.clear()
+                        console.print("[green]▶️  Resuming download...[/green]")
+                elif cmd == "q":
+                    self.abort.set()
                     self.paused.clear()
-                    success("▶️  Resuming download...")
-            elif cmd == "q":
-                self.abort.set()
-                self.paused.clear()
-                warn("🛑 Stopping... progress is saved, remaining items stay in the queue.")
-                return
+                    console.print(
+                        "[yellow]🛑 Stopping... progress is saved, remaining items "
+                        "stay in the queue.[/yellow]"
+                    )
+                    return
+        finally:
+            if use_cbreak and old_settings is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except termios.error:
+                    pass
 
     def wait_if_paused(self):
         while self.paused.is_set() and not self.abort.is_set():
@@ -887,16 +969,29 @@ def process_queue(db: QueueDB, api_key: Optional[str], workers: Optional[int] = 
                 warn(f"[{downloaded + failed}/{total}] ❌ kept in queue "
                      f"({message}): {filename}")
 
+    base_description = "Downloading wallpapers"
+
+    def wait_if_paused_with_indicator(bar, task_id):
+        """Same as controller.wait_if_paused(), but also reflects the
+        paused/running state in the bar's own description so the Live
+        display stays the single source of truth for what's on screen."""
+        if controller.paused.is_set():
+            bar.update(task_id, description=f"{base_description} [yellow](paused)[/yellow]")
+            while controller.paused.is_set() and not controller.abort.is_set():
+                time.sleep(0.3)
+            if not controller.abort.is_set():
+                bar.update(task_id, description=base_description)
+
     try:
         with Progress(*progress_columns, console=console, transient=False) as bar:
-            task_id = bar.add_task("Downloading wallpapers", total=total)
+            task_id = bar.add_task(base_description, total=total)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 future_to_item = {}
                 for item in items_to_process:
                     if controller.abort.is_set():
                         break
-                    controller.wait_if_paused()
+                    wait_if_paused_with_indicator(bar, task_id)
                     if controller.abort.is_set():
                         break
                     fut = pool.submit(download_image, item, item["folder"], api_key)
@@ -914,9 +1009,13 @@ def process_queue(db: QueueDB, api_key: Optional[str], workers: Optional[int] = 
         print()
         warn("Download interrupted. Progress saved — remaining items stay in the queue.")
         controller.abort.set()
+        controller.stop()
+        controller.join()
         sys.exit(1)
 
     controller.abort.set()
+    controller.stop()
+    controller.join()
 
     divider()
     remaining = db.count()
@@ -1013,7 +1112,6 @@ def show_main_menu(cfg: dict, db: QueueDB):
         options.append(("🧹 Clear the Queue", "clear_queue"))
     options.append(("🌑 Exit to Midgard", "exit"))
 
-    # allow_back is False here: this *is* the main menu already.
     return choose_from_menu("What would you like to do?", options, default_index=0, allow_back=False)
 
 
@@ -1174,7 +1272,7 @@ def main():
     args = parser.parse_args()
 
     # If no CLI search/queue flags were given at all, fall back to the
-    # friendly interactive wizard (this preserves the original UX).
+    # friendly interactive wizard.
     no_flags_given = not any([
         args.query, args.exclude, args.amount, args.folder, args.api_key,
         args.workers, args.no_download, args.resume, args.clear_queue,

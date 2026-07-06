@@ -319,10 +319,15 @@ class QueueDB:
                     file_size  INTEGER,
                     folder     TEXT NOT NULL,
                     added_at   TEXT NOT NULL,
+                    priority   INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (id, folder)
                 )
             """)
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_id ON queue(id)")
+            # Migration: older databases won't have this column yet.
+            existing_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(queue)")}
+            if "priority" not in existing_cols:
+                self._conn.execute("ALTER TABLE queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
             self._conn.execute("""
                 CREATE TABLE IF NOT EXISTS downloaded (
                     id             TEXT PRIMARY KEY,
@@ -368,10 +373,12 @@ class QueueDB:
             return cur.fetchone()[0]
 
     # -- queue ---------------------------------------------------------------
-    def add_many(self, rows: List[tuple]) -> int:
-        """rows: list of (id, path, file_size, folder). Returns count of
-        genuinely new rows inserted (ignores duplicates and anything
-        already marked as downloaded)."""
+    def add_many(self, rows: List[tuple], priority: int = 0) -> int:
+        """rows: list of (id, path, file_size, folder). `priority` controls
+        where these land relative to whatever's already queued: higher
+        numbers are downloaded first (see get_all's ordering). Returns
+        count of genuinely new rows inserted (ignores duplicates and
+        anything already marked as downloaded)."""
         if not rows:
             return 0
         now = self._now()
@@ -379,19 +386,29 @@ class QueueDB:
             before = self._conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
             self._conn.executemany(
                 """
-                INSERT OR IGNORE INTO queue (id, path, file_size, folder, added_at)
-                SELECT ?, ?, ?, ?, ?
+                INSERT OR IGNORE INTO queue (id, path, file_size, folder, added_at, priority)
+                SELECT ?, ?, ?, ?, ?, ?
                 WHERE NOT EXISTS (SELECT 1 FROM downloaded WHERE downloaded.id = ?)
                 """,
-                [(r[0], r[1], r[2], r[3], now, r[0]) for r in rows],
+                [(r[0], r[1], r[2], r[3], now, priority, r[0]) for r in rows],
             )
             after = self._conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
         return after - before
 
+    def max_priority(self) -> int:
+        """Highest priority value currently in the queue (0 if empty),
+        used to compute a value that will sort ahead of everything
+        already queued."""
+        with self._lock:
+            cur = self._conn.execute("SELECT MAX(priority) FROM queue")
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else 0
+
     def get_all(self) -> List[dict]:
         with self._lock:
             cur = self._conn.execute(
-                "SELECT id, path, file_size, folder FROM queue ORDER BY added_at ASC"
+                "SELECT id, path, file_size, folder FROM queue "
+                "ORDER BY priority DESC, added_at ASC"
             )
             return [
                 {"id": r[0], "path": r[1], "file_size": r[2], "folder": r[3]}
@@ -445,6 +462,13 @@ class DownloadController:
         self.abort = threading.Event()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Set if raw single-keypress reading turns out to be unusable at
+        # runtime (e.g. no real console attached -- some IDE terminals,
+        # services, or redirected stdin on Windows). Once True we
+        # permanently fall back to Enter-based line input instead of
+        # letting the listener thread silently die.
+        self._raw_mode_broken = False
+        self._warned_fallback = False
 
     def start(self):
         self.paused.clear()
@@ -469,31 +493,52 @@ class DownloadController:
 
     # -- key reading ---------------------------------------------------
     def _read_key(self) -> Optional[str]:
-        """Return one lowercase char as soon as it's available, or None if
-        nothing was typed within the poll window. Non-blocking so the loop
-        can also check self._stop/self.abort regularly."""
-        if _HAS_MSVCRT:
-            if msvcrt.kbhit():
-                try:
-                    return msvcrt.getwch().lower()
-                except UnicodeDecodeError:
-                    return None
-            time.sleep(0.1)
-            return None
+        """Return one lowercase char/word as soon as it's available, or
+        None if nothing was typed within the poll window. Non-blocking so
+        the loop can also check self._stop/self.abort regularly."""
+        if _HAS_MSVCRT and not self._raw_mode_broken:
+            try:
+                if msvcrt.kbhit():
+                    try:
+                        return msvcrt.getwch().lower()
+                    except UnicodeDecodeError:
+                        return None
+                time.sleep(0.1)
+                return None
+            except OSError:
+                # No real console attached (redirected stdin, some IDE
+                # terminals/services on Windows). Don't let the listener
+                # thread die silently -- fall back to Enter-based input
+                # for the rest of this run.
+                self._raw_mode_broken = True
 
-        if _HAS_TERMIOS and sys.stdin.isatty():
+        if _HAS_TERMIOS and sys.stdin.isatty() and not self._raw_mode_broken:
             try:
                 ready, _, _ = select.select([sys.stdin], [], [], 0.2)
             except (OSError, ValueError):
+                self._raw_mode_broken = True
                 return None
             if ready:
                 ch = sys.stdin.read(1)
                 return ch.lower() if ch else None
             return None
 
+        # Fallback: stdin isn't a usable real-time TTY (piped input, some
+        # IDE consoles, a broken raw-console handle, etc.) -- cbreak/raw
+        # mode isn't available, so use line-buffered reads (needs Enter).
         try:
+            ready = True
+            if _HAS_TERMIOS:
+                # Poll so we still notice self._stop/self.abort promptly
+                # instead of blocking forever on readline().
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                except (OSError, ValueError):
+                    ready = True  # best effort; just try to read
+            if not ready:
+                return None
             line = sys.stdin.readline()
-        except (EOFError, ValueError):
+        except (EOFError, ValueError, OSError):
             self.abort.set()
             return None
         if not line:
@@ -517,6 +562,12 @@ class DownloadController:
         try:
             while not self._stop.is_set() and not self.abort.is_set():
                 cmd = self._read_key()
+                if self._raw_mode_broken and not self._warned_fallback:
+                    self._warned_fallback = True
+                    console.print(
+                        "[yellow]⚠️  Instant keypress detection isn't available in this "
+                        "terminal — type p, r, or q and press Enter instead.[/yellow]"
+                    )
                 if not cmd:
                     continue
                 if cmd == "p":
@@ -908,11 +959,11 @@ def download_image(item: dict, folder: str, api_key: Optional[str]) -> tuple:
         return False, filename, f"disk error: {e}"
 
 
-def add_to_queue(db: QueueDB, wallpapers: List[dict], folder: str) -> int:
+def add_to_queue(db: QueueDB, wallpapers: List[dict], folder: str, priority: int = 0) -> int:
     rows = [(w.get("id"), w.get("path"), w.get("file_size"), folder) for w in wallpapers if w.get("id")]
     before_downloaded = db.downloaded_ids()
     skipped = sum(1 for w in wallpapers if w.get("id") in before_downloaded)
-    added = db.add_many(rows)
+    added = db.add_many(rows, priority=priority)
     if skipped:
         info(f"🟡 Skipped {skipped} wallpaper(s) already downloaded previously (in any folder).")
     return added
@@ -1050,7 +1101,12 @@ def process_queue(db: QueueDB, api_key: Optional[str], workers: Optional[int] = 
 
 
 def run_new_search(cfg: dict, db: QueueDB, params: Optional[SearchParams] = None,
-                    auto_download: Optional[bool] = None):
+                    auto_download: Optional[bool] = None,
+                    queue_position: Optional[str] = None):
+    """queue_position: 'front' to have these new results download before
+    whatever's already queued, 'end' to add them after. If None (the
+    interactive default), the user is asked -- but only when there's an
+    existing queue to jump ahead of."""
     """Collects search parameters (or uses ones already given via CLI),
     runs the search, and enqueues results. If the user backs out of the
     wizard, this simply returns without side effects."""
@@ -1099,8 +1155,23 @@ def run_new_search(cfg: dict, db: QueueDB, params: Optional[SearchParams] = None
         warn("No wallpapers found matching your criteria.")
         return
 
-    added = add_to_queue(db, wallpapers, params.folder)
+    existing_count = db.count()
+    if queue_position is None:
+        if existing_count:
+            jump_ahead = yes_no(
+                f"There {'is' if existing_count == 1 else 'are'} already {existing_count} "
+                f"item(s) queued. Download these new ones first (front of the queue)?",
+                default_yes=True,
+            )
+            queue_position = "front" if jump_ahead else "end"
+        else:
+            queue_position = "end"  # queue is empty, front/end makes no difference
+
+    priority = db.max_priority() + 1 if queue_position == "front" else 0
+    added = add_to_queue(db, wallpapers, params.folder, priority=priority)
     success(f"Found {len(wallpapers)} wallpaper(s). Added {added} new item(s) to the queue 📥")
+    if queue_position == "front" and existing_count and added:
+        info("⏩ These will download before the rest of the existing queue.")
     info(f"Queue now has {db.count()} item(s) total waiting to download.")
 
     if auto_download is None:
@@ -1232,6 +1303,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", "-w", type=int, help="Concurrent download workers (1-10)")
     p.add_argument("--no-download", action="store_true",
                     help="Only search and enqueue; don't download yet")
+    p.add_argument("--queue-position", choices=["front", "end"], default=None,
+                    help="Where new results go relative to an existing queue "
+                         "(default: end, unless run interactively where you'll be asked)")
     p.add_argument("--resume", action="store_true",
                     help="Skip search; just process whatever is already queued")
     p.add_argument("--clear-queue", action="store_true", help="Clear the queue and exit")
@@ -1282,7 +1356,8 @@ def cli_main(args: argparse.Namespace):
         )
 
         banner()
-        run_new_search(cfg, db, params=params, auto_download=not args.no_download)
+        run_new_search(cfg, db, params=params, auto_download=not args.no_download,
+                      queue_position=args.queue_position or "end")
     finally:
         db.close()
 

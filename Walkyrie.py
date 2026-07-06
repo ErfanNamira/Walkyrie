@@ -554,7 +554,7 @@ def build_purity_bits(choice):
 
 
 def sanitize_filename(name):
-    name = (name or "").strip() or "wallhaven_downloads"
+    name = (name or "").strip() or "walkyrie_downloads"
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = re.sub(r"\s+", "_", name)
     return name[:80]
@@ -575,7 +575,7 @@ class SearchParams:
     colors: Optional[str] = None
     seed: Optional[str] = None
     amount: Optional[int] = None
-    folder: str = "wallhaven_downloads"
+    folder: str = "walkyrie_downloads"
     workers: int = MAX_WORKERS_DEFAULT
 
 
@@ -674,7 +674,7 @@ def collect_search_params(cfg: dict) -> SearchParams:
             amount = 24
 
     default_folder = os.path.join(
-        os.getcwd(), sanitize_filename(query) if query else "wallhaven_downloads"
+        os.getcwd(), sanitize_filename(query) if query else "walkyrie_downloads"
     )
     folder = ask_text(f"📁 Output folder (Enter for default: {default_folder})", default="") or default_folder
 
@@ -1139,7 +1139,7 @@ def cli_main(args: argparse.Namespace):
 
         query = args.query or ""
         default_folder = os.path.join(
-            os.getcwd(), sanitize_filename(query) if query else "wallhaven_downloads"
+            os.getcwd(), sanitize_filename(query) if query else "walkyrie_downloads"
         )
 
         params = SearchParams(
